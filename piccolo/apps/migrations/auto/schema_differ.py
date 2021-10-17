@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import typing as t
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -498,4 +499,173 @@ class SchemaDiffer:
             count = len(statements.statements)
             print(f"{_message} {count}")
 
-        return [i for i in alter_statements.values()]
+        alter_statements_lst = [i for i in alter_statements.values()]
+
+        self._raise_if_alter_statements_have_conflicting_imports(
+            alter_statements_lst
+        )
+
+        return alter_statements_lst
+
+    @classmethod
+    def _raise_if_alter_statements_have_conflicting_imports(
+        cls, alter_statements: t.List[AlterStatements]
+    ) -> None:
+        conflicting_imports = cls._get_conflicting_imports(
+            alter_statements, ignore_duplicates=True
+        )
+        if len(conflicting_imports) != 0:
+            raise ConflictingExtraImportsError(
+                conflicting_imports=conflicting_imports,
+                message_template=(
+                    "Alter statements contain conflicting extra imports:\n"
+                    "{humanized_conflicting_imports}"
+                ),
+            )
+
+    @staticmethod
+    def _get_conflicting_imports(
+        alter_statements: t.List[AlterStatements],
+        ignore_duplicates: bool = False,
+    ) -> t.List[t.List[str]]:
+        import_node_accumulator = _AstImportNodeAccumulator()
+        for alter_statement in alter_statements:
+            for extra_import in alter_statement.extra_imports:
+                import_node_accumulator.add_import_str(repr(extra_import))
+
+        import_name_to_nodes_mapping: t.Dict[
+            str, t.List[t.Union[ast.Import, ast.ImportFrom]]
+        ] = {}
+        for import_node in import_node_accumulator.import_nodes:
+            for alias in import_node.names:
+                import_name = (
+                    alias.name if alias.asname is None else alias.asname
+                )
+
+                if import_name in import_name_to_nodes_mapping:
+                    import_name_to_nodes_mapping[import_name].append(
+                        import_node
+                    )
+                else:
+                    import_name_to_nodes_mapping[import_name] = [import_node]
+
+        conflicting_imports = []
+        for import_name, import_nodes in import_name_to_nodes_mapping.items():
+            if len(import_nodes) >= 2:
+                if ignore_duplicates and all(
+                    _are_equal_ast_import_nodes(import_nodes[0], import_node)
+                    for import_node in import_nodes[1:]
+                ):
+                    continue
+
+                conflicting_import_group = [
+                    _unparse_ast_import_node(import_node)
+                    for import_node in import_nodes
+                ]
+                conflicting_imports.append(conflicting_import_group)
+
+        return conflicting_imports
+
+
+class _AstImportNodeAccumulator(ast.NodeVisitor):
+    def __init__(self):
+        self.import_nodes: t.List[t.Union[ast.Import, ast.ImportFrom]] = []
+        super().__init__()
+
+    def add_import_str(self, import_str: str):
+        self.visit(ast.parse(import_str))
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self.import_nodes.append(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self.import_nodes.append(node)
+
+
+def _are_equal_ast_import_nodes(
+    import_node1: t.Union[ast.Import, ast.ImportFrom],
+    import_node2: t.Union[ast.Import, ast.ImportFrom],
+) -> bool:
+    if isinstance(import_node1, ast.Import) and not isinstance(
+        import_node2, ast.Import
+    ):
+        return False
+
+    elif isinstance(import_node1, ast.ImportFrom):
+        if not isinstance(import_node2, ast.ImportFrom):
+            return False
+
+        if (
+            import_node1.module != import_node2.module
+            or import_node1.level != import_node2.level
+        ):
+            return False
+
+    if len(import_node1.names) != len(import_node2.names):
+        return False
+
+    if any(
+        alias1.name != alias2.name or alias1.asname != alias2.asname
+        for alias1, alias2 in zip(import_node1.names, import_node2.names)
+    ):
+        return False
+
+    return True
+
+
+def _unparse_ast_import_node(
+    import_node: t.Union[ast.Import, ast.ImportFrom]
+) -> str:
+    aliases_str = ", ".join(
+        alias.name if alias.asname is None else alias.asname
+        for alias in import_node.names
+    )
+    if isinstance(import_node, ast.Import):
+        return f"import {aliases_str}"
+    elif isinstance(import_node, ast.ImportFrom):
+        dots = "." * import_node.level
+        module = getattr(import_node, "module", "")
+        return f"from {dots}{module} " f"import {aliases_str}"
+    else:
+        raise ValueError(
+            "import_node must be an instance of ast.Import or ast.ImportFrom"
+        )
+
+
+class AlterStatementsError(ValueError):
+    pass
+
+
+class ConflictingExtraImportsError(AlterStatementsError):
+    def __init__(
+        self,
+        conflicting_imports: t.List[t.List[str]],
+        message_template: str = (
+            "Conflicting extra imports:\n{humanized_conflicting_imports}"
+        ),
+    ):
+        error_message = message_template.format(
+            humanized_conflicting_imports=self.humanize_conflicting_imports(
+                conflicting_imports
+            )
+        )
+        super().__init__(error_message)
+
+    @classmethod
+    def humanize_conflicting_imports(
+        cls, conflicting_imports: t.List[t.List[str]], indent: str = "    "
+    ) -> str:
+        separator = f"{indent}- "
+        return separator + separator.join(
+            cls.humanize_conflicting_import_group(import_group)
+            for import_group in conflicting_imports
+        )
+
+    @staticmethod
+    def humanize_conflicting_import_group(
+        conflicting_import_group: t.List[str],
+    ) -> str:
+        quoted_imports = [
+            f'"{import_}"' for import_ in conflicting_import_group
+        ]
+        return f"{', '.join(quoted_imports[:-1])} and {quoted_imports[-1]}"
